@@ -1,23 +1,65 @@
-import os
+﻿import os
 import sys
 import threading
 import json
 from typing import Optional, List
 
-from google import genai
-from google.genai import types
-
-import anthropic
-
 from logger import print_panel, print_status, log_step, logger
 
-import modal
-from modal.stream_type import StreamType
+# Lazy imports for different backends
+_genai_client = None
+_anthropic_client = None
+_ollama_client = None
+_use_local_sandbox = False
 
 # Cache a single sandbox per run so the agent can keep state across tool calls.
-_shared_sandbox: Optional[modal.Sandbox] = None
+_shared_sandbox = None  # For Modal sandbox (when using remote)
 _shared_gpu: Optional[str] = None  # Track which GPU the sandbox was created with
 _selected_gpu: Optional[str] = None  # User-selected GPU for this run
+
+
+def _init_ollama(model: str):
+    """Initialize Ollama client."""
+    global _ollama_client, _use_local_sandbox
+    from ollama_client import OllamaClient, test_ollama_connection
+    
+    if not test_ollama_connection():
+        raise ConnectionError(
+            "Cannot connect to Ollama. Make sure Ollama is running:\n"
+            "  1. Install Ollama: https://ollama.ai\n"
+            "  2. Start Ollama: ollama serve\n"
+            "  3. Pull a model: ollama pull qwen2.5-coder:14b"
+        )
+    
+    _ollama_client = OllamaClient(model=model)
+    _use_local_sandbox = True
+    
+    # Check if model exists
+    if not _ollama_client.check_model_exists(model):
+        available = [m.get("name", "") for m in _ollama_client.list_models()]
+        raise ValueError(
+            f"Model '{model}' not found in Ollama.\n"
+            f"Available models: {', '.join(available) if available else 'none'}\n"
+            f"Pull it with: ollama pull {model}"
+        )
+    
+    return _ollama_client
+
+
+def _init_gemini():
+    """Initialize Gemini client."""
+    global _genai_client
+    from google import genai
+    _genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    return _genai_client
+
+
+def _init_anthropic():
+    """Initialize Anthropic client."""
+    global _anthropic_client
+    import anthropic
+    _anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    return _anthropic_client
 
 
 def emit_event(event_type: str, data: dict) -> None:
@@ -42,7 +84,7 @@ def _build_generation_config(
     tools: Optional[list] = None,
     system_instruction: Optional[str] = None,
     disable_autofc: bool = False,
-) -> types.GenerateContentConfig:
+):
     """
     Build a GenerateContentConfig that:
 
@@ -51,6 +93,8 @@ def _build_generation_config(
     - Optionally disables automatic function calling so we can control
       when tools run and show thoughts before actions.
     """
+    from google.genai import types
+    
     thinking_config = types.ThinkingConfig(
         thinking_level=types.ThinkingLevel.HIGH,
         include_thoughts=True,
@@ -72,8 +116,10 @@ def _build_generation_config(
     return types.GenerateContentConfig(**config_kwargs)
 
 
-def _get_shared_sandbox(gpu: Optional[str]) -> modal.Sandbox:
+def _get_shared_sandbox(gpu: Optional[str]):
     """Create (once) and return a persistent sandbox for this run."""
+    import modal
+    
     global _shared_sandbox, _shared_gpu
     if _shared_sandbox is not None:
         # Reuse only if GPU selection matches
@@ -125,6 +171,56 @@ def _close_shared_sandbox():
 
 def execute_in_sandbox(code: str):
     """
+    Executes Python code in a sandbox environment.
+
+    When using Ollama (local mode):
+    - Executes code locally using the system's Python and GPU
+    
+    When using Gemini/Claude (remote mode):
+    - Uses Modal's remote sandboxes with cloud GPUs
+
+    Behavior:
+    - Streams both STDOUT and STDERR to your local CLI *as they are produced*
+    - Captures full STDOUT/STDERR buffers and returns them as a string
+    """
+    global _use_local_sandbox
+    
+    if _use_local_sandbox:
+        return _execute_in_local_sandbox(code)
+    else:
+        return _execute_in_modal_sandbox(code)
+
+
+def _execute_in_local_sandbox(code: str):
+    """Execute code locally using the local sandbox."""
+    from local_sandbox import execute_code_locally
+    
+    def on_stdout(chunk: str):
+        try:
+            emit_event("AGENT_STREAM", {"stream": "stdout", "chunk": chunk})
+        except Exception:
+            pass
+    
+    def on_stderr(chunk: str):
+        try:
+            emit_event("AGENT_STREAM", {"stream": "stderr", "chunk": chunk})
+        except Exception:
+            pass
+    
+    try:
+        result = execute_code_locally(
+            code,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+        )
+        return result
+    except Exception as e:
+        log_step("ERROR", f"Local Execution Failed: {str(e)}")
+        return f"Local Execution Failed: {str(e)}"
+
+
+def _execute_in_modal_sandbox(code: str):
+    """
     Executes Python code inside a persistent Modal Sandbox using sandbox.exec.
 
     Behavior:
@@ -134,6 +230,10 @@ def execute_in_sandbox(code: str):
     - Captures full STDOUT/STDERR buffers and returns them as a string so the
       agent can inspect logs after the run finishes.
     """
+    # Lazy import Modal only when needed
+    import modal
+    from modal.stream_type import StreamType
+    
     try:
         sandbox = _get_shared_sandbox(_selected_gpu)
 
@@ -268,13 +368,37 @@ Working loop:
 
 
 def run_experiment_loop(hypothesis: str, test_mode: bool = False, model: str = "gemini-3-pro-preview"):
-    """Main agent loop using Gemini 3 Pro or Claude Opus 4.5 with thinking + manual tool calling."""
+    """Main agent loop using Gemini 3 Pro, Claude Opus 4.5, or Ollama with thinking + manual tool calling."""
+    global _use_local_sandbox
+    
     gpu_hint = _selected_gpu or "CPU"
-
+    
+    # Determine if using Ollama (local mode)
+    is_ollama = model.startswith("ollama:")
+    
+    if is_ollama:
+        # Extract model name after "ollama:"
+        ollama_model = model[7:]  # Remove "ollama:" prefix
+        from local_sandbox import get_gpu_info, get_environment_info
+        gpu_hint = get_gpu_info()
+        _use_local_sandbox = True
+    
     print_panel(f"Hypothesis: {hypothesis}", "Starting Experiment", "bold green")
     log_step("START", f"Hypothesis: {hypothesis}")
-    print_status(f"Sandbox GPU request: {gpu_hint}", "info")
-    print_status(f"Model: {model}", "info")
+    
+    # Emit AGENT_START for the frontend to track this agent
+    emit_event("AGENT_START", {
+        "agent_id": "1",  # Single agent mode uses ID "1"
+        "hypothesis": hypothesis,
+        "gpu": gpu_hint if is_ollama else _selected_gpu or "any",
+    })
+    
+    if is_ollama:
+        print_status(f"Local execution: {gpu_hint}", "info")
+        print_status(f"Model: Ollama ({ollama_model})", "info")
+    else:
+        print_status(f"Sandbox GPU request: {gpu_hint}", "info")
+        print_status(f"Model: {model}", "info")
 
     if test_mode:
         print_status("TEST MODE ENABLED: Using mock data and skipping LLM calls.", "bold yellow")
@@ -345,10 +469,13 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False, model: str = "
             "[DONE]"
         )
         print_panel(final_report, "Final Report", "bold green")
+        emit_event("AGENT_COMPLETE", {"agent_id": "1", "exit_code": 0})
         return
 
     # Branch based on model selection
-    if model == "claude-opus-4-5":
+    if is_ollama:
+        _run_ollama_experiment_loop(hypothesis, ollama_model, gpu_hint)
+    elif model == "claude-opus-4-5":
         _run_claude_experiment_loop(hypothesis, gpu_hint)
     else:
         _run_gemini_experiment_loop(hypothesis, gpu_hint)
@@ -356,6 +483,8 @@ def run_experiment_loop(hypothesis: str, test_mode: bool = False, model: str = "
 
 def _run_claude_experiment_loop(hypothesis: str, gpu_hint: str):
     """Run the experiment loop using Claude Opus 4.5 with extended thinking."""
+    import anthropic
+    
     print_status("Claude extended thinking enabled", "info")
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -496,7 +625,24 @@ def _run_claude_experiment_loop(hypothesis: str, gpu_hint: str):
             })
 
             if fn_name == "execute_in_sandbox":
-                result = execute_in_sandbox(**fn_args)
+                # Check if code contains [DONE] - treat as completion signal
+                code_content = fn_args.get("code", "")
+                if "[DONE]" in code_content:
+                    print_status("Agent signaled completion via tool call.", "success")
+                    result = "Task completed."
+                else:
+                    result = execute_in_sandbox(**fn_args)
+                    
+                    # Check for execution errors and prompt for correction
+                    if "Exit Code: 1" in result or "Error" in result or "Traceback" in result:
+                        print_status("Execution error detected - agent will auto-correct", "warning")
+                        emit_event("AGENT_ERROR", {"error": result[:500]})
+                        result = (
+                            f"EXECUTION ERROR:\n{result}\n\n"
+                            "Please analyze the error above and fix your code. "
+                            "Common issues: syntax errors, missing imports, incorrect indentation. "
+                            "Provide corrected code in a new execute_in_sandbox call."
+                        )
             else:
                 result = (
                     f"Unsupported tool '{fn_name}'. "
@@ -574,12 +720,199 @@ def _run_claude_experiment_loop(hypothesis: str, gpu_hint: str):
 
         final_report = "\n\n".join(t for t in final_text if t)
         print_panel(final_report, "Final Report", "bold green")
+        emit_event("AGENT_COMPLETE", {"agent_id": "1", "exit_code": 0})
     finally:
         _close_shared_sandbox()
 
 
+def _run_ollama_experiment_loop(hypothesis: str, model: str, gpu_hint: str):
+    """Run the experiment loop using a local Ollama model."""
+    from ollama_client import OllamaClient, OllamaMessage
+    from local_sandbox import cleanup as cleanup_sandbox
+    
+    print_status(f"Ollama model: {model}", "info")
+    print_status(f"Local GPU: {gpu_hint}", "info")
+    
+    # Initialize Ollama client
+    try:
+        client = _init_ollama(model)
+    except Exception as e:
+        print_status(f"Failed to initialize Ollama: {e}", "error")
+        logger.error(f"Ollama initialization failed: {e}")
+        return
+    
+    # Build tool definition
+    tool_def = {
+        "name": "execute_in_sandbox",
+        "description": (
+            "Executes Python code locally on the user's machine. "
+            "The environment has numpy, pandas, torch, scikit-learn, and matplotlib. "
+            f"GPU: {gpu_hint}. "
+            "Returns the exit code, stdout, and stderr from the execution."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python code to execute."
+                }
+            },
+            "required": ["code"]
+        }
+    }
+    
+    system_prompt = _build_system_prompt(gpu_hint)
+    
+    # Conversation history
+    messages = [
+        OllamaMessage(role="user", content=f"Hypothesis: {hypothesis}")
+    ]
+    
+    max_steps = 10
+    
+    try:
+        for step in range(1, max_steps + 1):
+            print_status(f"Step {step}...", "dim")
+            
+            try:
+                # Accumulate streaming response
+                full_content = ""
+                full_thinking = ""
+                
+                for chunk in client.chat(
+                    messages=messages,
+                    tools=[tool_def],
+                    system_prompt=system_prompt,
+                    stream=True,
+                ):
+                    if chunk.content and not chunk.done:
+                        # Stream partial content
+                        emit_event("AGENT_THOUGHT_STREAM", {"chunk": chunk.content})
+                    
+                    if chunk.done:
+                        full_content = chunk.content
+                        full_thinking = chunk.thinking
+                        tool_calls = chunk.tool_calls
+                        break
+                
+            except Exception as e:
+                print_status(f"Ollama API Error: {e}", "error")
+                logger.error(f"Ollama API Error: {e}")
+                break
+            
+            # Show thinking if present
+            if full_thinking:
+                print_panel(full_thinking, "Agent Thinking", "thought")
+                log_step("THOUGHT", full_thinking)
+                emit_event("AGENT_THOUGHT", {"thought": full_thinking})
+            
+            # Extract text content (remove tool_call blocks for display)
+            import re
+            display_content = re.sub(r'```tool_call\s*\n?.*?\n?```', '', full_content, flags=re.DOTALL).strip()
+            
+            if display_content:
+                print_panel(display_content, "Agent Message", "info")
+                log_step("MODEL", display_content)
+            
+            # Check for completion
+            if "[DONE]" in full_content:
+                print_status("Agent signaled completion.", "success")
+                break
+            
+            # Add assistant message to history
+            messages.append(OllamaMessage(role="assistant", content=full_content))
+            
+            # Process tool calls
+            if not tool_calls:
+                print_status(
+                    "No tool calls in this step; assuming experiment is complete.", "info"
+                )
+                break
+            
+            # Execute each tool call
+            for tc in tool_calls:
+                fn_name = tc.name
+                fn_args = tc.arguments
+                
+                print_panel(f"{fn_name}({fn_args})", "Tool Call", "code")
+                log_step("TOOL_CALL", f"{fn_name}({fn_args})")
+                emit_event("AGENT_TOOL", {"tool": fn_name, "args": fn_args})
+                
+                if fn_name == "execute_in_sandbox":
+                    # Check if code contains [DONE] - treat as completion signal
+                    code_content = fn_args.get("code", "")
+                    if "[DONE]" in code_content:
+                        print_status("Agent signaled completion via tool call.", "success")
+                        result = "Task completed."
+                    else:
+                        result = execute_in_sandbox(**fn_args)
+                        
+                        # Check for execution errors and prompt for correction
+                        if "Exit Code: 1" in result or "Error" in result or "Traceback" in result:
+                            print_status("Execution error detected - agent will auto-correct", "warning")
+                            emit_event("AGENT_ERROR", {"error": result[:500]})
+                            # Add error context to help the model fix it
+                            result = (
+                                f"EXECUTION ERROR:\n{result}\n\n"
+                                "Please analyze the error above and fix your code. "
+                                "Common issues: syntax errors, missing imports, incorrect indentation. "
+                                "Provide corrected code in a new execute_in_sandbox call."
+                            )
+                else:
+                    result = f"Unsupported tool '{fn_name}'. Only 'execute_in_sandbox' is available."
+                
+                # Truncate long outputs
+                if isinstance(result, str) and len(result) > 20000:
+                    result = result[:10000] + "\n...[TRUNCATED]...\n" + result[-10000:]
+                
+                print_panel(result, "Tool Result", "result")
+                log_step("TOOL_RESULT", "Executed")
+                emit_event("AGENT_TOOL_RESULT", {"tool": fn_name, "result": result})
+                
+                # Add tool result to history
+                messages.append(OllamaMessage(
+                    role="user",  # Ollama uses "user" role for tool results
+                    content=f"Tool result for {fn_name}:\n{result}"
+                ))
+        
+        # Final report generation
+        print_status("Generating Final Report...", "bold green")
+        messages.append(OllamaMessage(
+            role="user",
+            content=(
+                "Generate a concise, information-dense report that explains "
+                "how you tested the hypothesis, what you observed, and your "
+                "final conclusion."
+            )
+        ))
+        
+        try:
+            final_response = client.chat(
+                messages=messages,
+                tools=None,  # No tools for final report
+                system_prompt=system_prompt,
+                stream=False,
+            )
+            
+            final_report = final_response.content
+            print_panel(final_report, "Final Report", "bold green")
+            emit_event("AGENT_COMPLETE", {"agent_id": "1", "exit_code": 0})
+            
+        except Exception as e:
+            print_status(f"Failed to generate final report: {e}", "error")
+            logger.error(f"Failed to generate final report: {e}")
+            emit_event("AGENT_COMPLETE", {"agent_id": "1", "exit_code": 1})
+    
+    finally:
+        cleanup_sandbox()
+
+
 def _run_gemini_experiment_loop(hypothesis: str, gpu_hint: str):
     """Run the experiment loop using Gemini 3 Pro with thinking mode."""
+    from google import genai
+    from google.genai import types
+    
     print_status("Gemini thinking: HIGH (thought summaries visible)", "info")
 
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
@@ -744,7 +1077,24 @@ def _run_gemini_experiment_loop(hypothesis: str, gpu_hint: str):
             emit_event("AGENT_TOOL", {"tool": fn_name, "args": fn_args})
 
             if fn_name == "execute_in_sandbox":
-                result = execute_in_sandbox(**fn_args)
+                # Check if code contains [DONE] - treat as completion signal
+                code_content = fn_args.get("code", "")
+                if "[DONE]" in code_content:
+                    print_status("Agent signaled completion via tool call.", "success")
+                    result = "Task completed."
+                else:
+                    result = execute_in_sandbox(**fn_args)
+                    
+                    # Check for execution errors and prompt for correction
+                    if "Exit Code: 1" in result or "Error" in result or "Traceback" in result:
+                        print_status("Execution error detected - agent will auto-correct", "warning")
+                        emit_event("AGENT_ERROR", {"error": result[:500]})
+                        result = (
+                            f"EXECUTION ERROR:\n{result}\n\n"
+                            "Please analyze the error above and fix your code. "
+                            "Common issues: syntax errors, missing imports, incorrect indentation. "
+                            "Provide corrected code in a new execute_in_sandbox call."
+                        )
             else:
                 result = (
                     f"Unsupported tool '{fn_name}'. "
@@ -821,5 +1171,6 @@ def _run_gemini_experiment_loop(hypothesis: str, gpu_hint: str):
                 final_text += part.text
         
         print_panel(final_text, "Final Report", "bold green")
+        emit_event("AGENT_COMPLETE", {"agent_id": "1", "exit_code": 0})
     finally:
         _close_shared_sandbox()

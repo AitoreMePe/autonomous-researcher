@@ -77,9 +77,9 @@ class SingleExperimentRequest(BaseModel):
         "gemini-3-pro-preview",
         description=(
             "The LLM model to use for the experiment. "
-            "Options: 'gemini-3-pro-preview' or 'claude-opus-4-5'."
+            "Options: 'gemini-3-pro-preview', 'claude-opus-4-5', or 'ollama:<model>' for local execution."
         ),
-        examples=["gemini-3-pro-preview", "claude-opus-4-5"],
+        examples=["gemini-3-pro-preview", "claude-opus-4-5", "ollama:qwen2.5-coder:14b"],
     )
     test_mode: bool = Field(
         False,
@@ -124,9 +124,9 @@ class OrchestratorExperimentRequest(BaseModel):
         "gemini-3-pro-preview",
         description=(
             "The LLM model to use for the experiment. "
-            "Options: 'gemini-3-pro-preview' or 'claude-opus-4-5'."
+            "Options: 'gemini-3-pro-preview', 'claude-opus-4-5', or 'ollama:<model>' for local execution."
         ),
-        examples=["gemini-3-pro-preview", "claude-opus-4-5"],
+        examples=["gemini-3-pro-preview", "claude-opus-4-5", "ollama:qwen2.5-coder:14b"],
     )
     num_agents: int = Field(
         3,
@@ -637,6 +637,53 @@ def get_state() -> Dict[str, Any]:
         return {
             "status": "active",
             "info": "Orchestrator module not loaded",
+        }
+
+
+@app.get(
+    "/api/ollama/status",
+    summary="Check Ollama connection and list available models",
+)
+def ollama_status() -> Dict[str, Any]:
+    """
+    Check if Ollama is running and return available models.
+    
+    This is useful for the frontend to populate model dropdowns
+    and validate that Ollama is accessible.
+    """
+    try:
+        from ollama_client import test_ollama_connection, OllamaClient, get_recommended_models
+        
+        is_connected = test_ollama_connection()
+        
+        if not is_connected:
+            return {
+                "connected": False,
+                "models": [],
+                "recommended": get_recommended_models(),
+                "error": "Cannot connect to Ollama. Make sure it's running: ollama serve"
+            }
+        
+        client = OllamaClient()
+        models = client.list_models()
+        
+        return {
+            "connected": True,
+            "models": [
+                {
+                    "name": m.get("name", ""),
+                    "size": m.get("size", 0),
+                    "modified_at": m.get("modified_at", ""),
+                }
+                for m in models
+            ],
+            "recommended": get_recommended_models(),
+        }
+    except Exception as e:
+        return {
+            "connected": False,
+            "models": [],
+            "error": str(e),
         }
 
 

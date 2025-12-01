@@ -24,7 +24,7 @@ type PendingRun = {
 };
 
 export function LabNotebook() {
-  const { isRunning, agents, orchestrator, error: experimentError, startExperiment, clearError } = useExperiment();
+  const { isRunning, agents, orchestrator, error: experimentError, progress, startExperiment, clearError } = useExperiment();
   const [task, setTask] = useState("");
   const [mode, setMode] = useState<"single" | "orchestrator">("orchestrator");
   const [testMode, setTestMode] = useState(false);
@@ -37,7 +37,22 @@ export function LabNotebook() {
     modalTokenId: "",
     modalTokenSecret: "",
   });
-  const [selectedModel, setSelectedModel] = useState<"gemini-3-pro-preview" | "claude-opus-4-5">("gemini-3-pro-preview");
+  const [selectedModel, setSelectedModel] = useState<string>("ollama:qwen3:8b"); // Default to local Ollama
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+  const [ollamaConnected, setOllamaConnected] = useState<boolean | null>(null);
+  
+  // Check Ollama status on load
+  useEffect(() => {
+    fetch("http://localhost:8080/api/ollama/status")
+      .then(res => res.json())
+      .then(data => {
+        setOllamaConnected(data.connected);
+        if (data.connected && data.models) {
+          setOllamaModels(data.models.map((m: { name: string }) => m.name));
+        }
+      })
+      .catch(() => setOllamaConnected(false));
+  }, []);
   const [showCredentialPrompt, setShowCredentialPrompt] = useState(false);
   const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
   const [isCheckingCredentials, setIsCheckingCredentials] = useState(false);
@@ -97,6 +112,15 @@ export function LabNotebook() {
     setIsCheckingCredentials(true);
 
     try {
+      // Ollama models run locally - no API keys needed
+      const isOllama = selectedModel.startsWith("ollama:");
+      
+      if (isOllama) {
+        // For Ollama, just start the experiment directly
+        startExperiment(mode, config);
+        return;
+      }
+      
       const status = await fetchCredentialStatus();
       setCredentialStatus(status);
 
@@ -252,11 +276,26 @@ export function LabNotebook() {
                                     <div className="h-4 w-[1px] bg-[#333]" />
                                     <select
                                         value={selectedModel}
-                                        onChange={(e) => setSelectedModel(e.target.value as "gemini-3-pro-preview" | "claude-opus-4-5")}
+                                        onChange={(e) => setSelectedModel(e.target.value)}
                                         className="bg-transparent text-[#86868b] text-xs font-medium focus:outline-none cursor-pointer hover:text-white transition-colors"
                                     >
-                                        <option value="gemini-3-pro-preview">Gemini 3 Pro</option>
-                                        <option value="claude-opus-4-5">Claude Opus 4.5</option>
+                                        <optgroup label="â˜ï¸ Cloud APIs">
+                                            <option value="gemini-3-pro-preview">Gemini 3 Pro</option>
+                                            <option value="claude-opus-4-5">Claude Opus 4.5</option>
+                                        </optgroup>
+                                        <optgroup label={ollamaConnected ? "ðŸ¦™ Ollama (Local)" : "ðŸ¦™ Ollama (Offline)"}>
+                                            {ollamaModels.length > 0 ? (
+                                                ollamaModels.map(model => (
+                                                    <option key={model} value={`ollama:${model}`}>
+                                                        {model}
+                                                    </option>
+                                                ))
+                                            ) : (
+                                                <option value="ollama:qwen3:8b" disabled={!ollamaConnected}>
+                                                    {ollamaConnected === false ? "Ollama not running" : "Loading..."}
+                                                </option>
+                                            )}
+                                        </optgroup>
                                     </select>
                                 </div>
 
@@ -299,7 +338,7 @@ export function LabNotebook() {
                     <div className="min-h-[60vh] flex flex-col justify-center items-center space-y-8 animate-in fade-in duration-700">
                         <div className="space-y-4 text-center max-w-lg">
                             <div className="w-16 h-16 mx-auto rounded-full bg-red-500/10 border border-red-500/30 flex items-center justify-center">
-                                <span className="text-2xl">⚠️</span>
+                                <span className="text-2xl">âš ï¸</span>
                             </div>
                             <h2 className="text-xl font-light text-white tracking-wide">
                                 Experiment Failed
@@ -411,11 +450,23 @@ export function LabNotebook() {
                 
                 {/* Running Indicator at Bottom */}
                 {isRunning && orchestrator.timeline.length > 0 && (
-                    <div className="flex justify-center py-12">
+                    <div className="flex flex-col items-center gap-4 py-12">
+                        {/* Progress Bar */}
+                        <div className="w-64 h-2 bg-[#1d1d1f] rounded-full overflow-hidden border border-[#333]">
+                            <div 
+                                className="h-full bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 transition-all duration-500 ease-out"
+                                style={{ width: `${progress.percent}%` }}
+                            />
+                        </div>
+                        
+                        {/* Status Badge */}
                         <div className="flex items-center gap-3 px-4 py-2 rounded-full bg-[#1d1d1f] border border-[#333]">
                             <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
                             <span className="text-[10px] font-medium text-[#86868b] uppercase tracking-widest">
-                                Orchestrating
+                                {progress.stageLabel}
+                            </span>
+                            <span className="text-[11px] font-bold text-white tabular-nums">
+                                {progress.percent}%
                             </span>
                         </div>
                     </div>
@@ -449,3 +500,4 @@ export function LabNotebook() {
     </div>
   );
 }
+

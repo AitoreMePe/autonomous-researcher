@@ -1,6 +1,6 @@
-// In production (Railway), the API is served from the same origin
-// In development, we use localhost:8000
-export const API_BASE_URL = import.meta.env.DEV ? "http://localhost:8000" : "";
+﻿// In production (Railway), the API is served from the same origin
+// In development, we use localhost:8080
+export const API_BASE_URL = import.meta.env.DEV ? "http://localhost:8080" : "";
 
 // LocalStorage key for user credentials
 const CREDENTIALS_STORAGE_KEY = "ai_researcher_credentials";
@@ -225,3 +225,4 @@ export async function saveCredentials(payload: CredentialUpdatePayload): Promise
     // Return the new status based on what we just stored + what was already there
     return fetchCredentialStatus();
 }
+

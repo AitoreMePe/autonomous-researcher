@@ -7,12 +7,10 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any
 
-from google import genai
-from google.genai import types
-
-import anthropic
-
 from logger import print_panel, print_status, log_step, logger
+
+# Lazy imports for different backends
+_use_local_sandbox = False
 
 
 # Global orchestrator state
@@ -71,7 +69,7 @@ def _build_orchestrator_generation_config(
     tools: Optional[List] = None,
     system_instruction: Optional[str] = None,
     disable_autofc: bool = False,
-) -> types.GenerateContentConfig:
+):
     """
     Build a GenerateContentConfig for the orchestrator agent.
 
@@ -80,6 +78,8 @@ def _build_orchestrator_generation_config(
     - Optionally disables automatic function calling so we can manually run tools
       and show thoughts before actions.
     """
+    from google.genai import types
+    
     thinking_config = types.ThinkingConfig(
         thinking_level=types.ThinkingLevel.HIGH,
         include_thoughts=True,
@@ -430,6 +430,7 @@ def run_orchestrator_loop(
         "bold magenta",
     )
     log_step("ORCH_START", f"Research Task: {research_task}")
+    emit_event("ORCH_START", {"task": research_task})
     print_status(
         f"Orchestrator configuration: {num_initial_agents} initial agents, "
         f"up to {max_rounds} rounds.",
@@ -519,10 +520,26 @@ def run_orchestrator_loop(
         emit_event("ORCH_PAPER", {"content": final_paper})
         return
 
-    print_status(f"Model: {model}", "info")
+    # Determine if using Ollama (local mode)
+    is_ollama = model.startswith("ollama:")
+    
+    if is_ollama:
+        ollama_model = model[7:]  # Remove "ollama:" prefix
+        print_status(f"Model: Ollama ({ollama_model})", "info")
+    else:
+        print_status(f"Model: {model}", "info")
 
     # Branch based on model selection
-    if model == "claude-opus-4-5":
+    if is_ollama:
+        _run_ollama_orchestrator_loop(
+            research_task=research_task,
+            ollama_model=ollama_model,
+            num_initial_agents=num_initial_agents,
+            max_rounds=max_rounds,
+            default_gpu=default_gpu,
+            max_parallel_experiments=max_parallel_experiments,
+        )
+    elif model == "claude-opus-4-5":
         _run_claude_orchestrator_loop(
             research_task=research_task,
             num_initial_agents=num_initial_agents,
@@ -568,6 +585,254 @@ def _build_claude_orchestrator_tool_definition() -> dict:
     }
 
 
+def _run_ollama_orchestrator_loop(
+    research_task: str,
+    ollama_model: str,
+    num_initial_agents: int,
+    max_rounds: int,
+    default_gpu: Optional[str],
+    max_parallel_experiments: int,
+) -> None:
+    """Run the orchestrator loop using a local Ollama model."""
+    from ollama_client import OllamaClient, OllamaMessage, test_ollama_connection
+    from local_sandbox import get_gpu_info
+    
+    print_status(f"Ollama model: {ollama_model}", "info")
+    print_status(f"Local GPU: {get_gpu_info()}", "info")
+    
+    # Initialize Ollama client
+    if not test_ollama_connection():
+        print_status(
+            "Cannot connect to Ollama. Make sure Ollama is running:\n"
+            "  1. Install Ollama: https://ollama.ai\n"
+            "  2. Start Ollama: ollama serve\n"
+            "  3. Pull a model: ollama pull qwen2.5-coder:14b",
+            "error"
+        )
+        return
+    
+    client = OllamaClient(model=ollama_model)
+    
+    # Check if model exists
+    if not client.check_model_exists(ollama_model):
+        available = [m.get("name", "") for m in client.list_models()]
+        print_status(
+            f"Model '{ollama_model}' not found.\n"
+            f"Available: {', '.join(available) if available else 'none'}\n"
+            f"Pull it: ollama pull {ollama_model}",
+            "error"
+        )
+        return
+    
+    # Build tool definition
+    tool_def = {
+        "name": "run_researcher",
+        "description": (
+            "Launches an independent single-researcher agent that will interpret a hypothesis, "
+            "plan experiments, run Python code locally, and produce a final report. "
+            "Returns a JSON object with experiment_id, hypothesis, exit_code, and transcript."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hypothesis": {
+                    "type": "string",
+                    "description": "The experimental hypothesis to test."
+                },
+                "gpu": {
+                    "type": "string",
+                    "description": "Optional GPU hint (ignored in local mode, uses system GPU)."
+                }
+            },
+            "required": ["hypothesis"]
+        }
+    }
+    
+    system_prompt = _build_orchestrator_system_prompt(
+        num_initial_agents=num_initial_agents,
+        max_rounds=max_rounds,
+        default_gpu_hint="Local GPU (uses system CUDA)",
+        max_parallel_experiments=max_parallel_experiments,
+    )
+    
+    # Conversation history
+    messages = [
+        OllamaMessage(
+            role="user",
+            content=(
+                "High-level research task:\n"
+                f"{research_task}\n\n"
+                "Begin by decomposing this into concrete hypotheses and planning "
+                "which ones require empirical validation. When appropriate, "
+                "call run_researcher for hypotheses that need experiments."
+            )
+        )
+    ]
+    
+    all_experiments: List[Dict[str, Any]] = []
+    max_steps = max(8, max_rounds * 3)
+    
+    for step in range(1, max_steps + 1):
+        print_status(f"Orchestrator step {step}...", "dim")
+        
+        try:
+            # Get response from Ollama
+            full_content = ""
+            full_thinking = ""
+            tool_calls = []
+            
+            for chunk in client.chat(
+                messages=messages,
+                tools=[tool_def],
+                system_prompt=system_prompt,
+                stream=True,
+            ):
+                if chunk.content and not chunk.done:
+                    emit_event("ORCH_THOUGHT_STREAM", {"chunk": chunk.content})
+                
+                if chunk.done:
+                    full_content = chunk.content
+                    full_thinking = chunk.thinking
+                    tool_calls = chunk.tool_calls
+                    break
+            
+        except Exception as e:
+            print_status(f"Ollama API Error: {e}", "error")
+            logger.error(f"Ollama API Error: {e}")
+            break
+        
+        # Show thinking if present
+        if full_thinking:
+            print_panel(full_thinking, "Orchestrator Thinking", "thought")
+            log_step("ORCH_THOUGHT", full_thinking)
+        
+        # Extract text content for display
+        import re
+        display_content = re.sub(r'```tool_call\s*\n?.*?\n?```', '', full_content, flags=re.DOTALL).strip()
+        
+        if display_content:
+            print_panel(display_content, "Orchestrator Message", "info")
+            log_step("ORCH_MODEL", display_content)
+            emit_event("ORCH_MODEL", {"content": display_content[:500]})
+        
+        # Check for completion
+        if "[DONE]" in full_content:
+            if display_content:
+                final_content = display_content.replace("[DONE]", "").strip()
+                if final_content:
+                    print_panel(final_content, "Final Paper", "bold green")
+                    log_step("ORCH_FINAL", "Final paper generated (in loop).")
+                    emit_event("ORCH_PAPER", {"content": final_content})
+            print_status("Orchestrator signaled completion.", "success")
+            return
+        
+        # Add assistant message to history
+        messages.append(OllamaMessage(role="assistant", content=full_content))
+        
+        # Process tool calls
+        if not tool_calls:
+            print_status(
+                "Orchestrator: no tool calls in this step; assuming research is complete.",
+                "info",
+            )
+            break
+        
+        # Execute tool calls
+        def _execute_single_call(tc):
+            fn_name = tc.name
+            fn_args = tc.arguments
+            
+            print_panel(
+                f"{fn_name}({json.dumps(fn_args, indent=2)})",
+                "Orchestrator Tool Call",
+                "code",
+            )
+            log_step("ORCH_TOOL_CALL", f"{fn_name}({fn_args})")
+            emit_event("ORCH_TOOL_CALL", {"tool": fn_name, "args": fn_args})
+            
+            if fn_name == "run_researcher":
+                return run_researcher(**fn_args)
+            else:
+                return {"error": f"Unsupported tool '{fn_name}'."}
+        
+        max_workers = max(1, min(max_parallel_experiments, len(tool_calls)))
+        print_status(
+            f"Launching {len(tool_calls)} experiment(s) with up to {max_workers} in parallel...",
+            "info",
+        )
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_execute_single_call, tc) for tc in tool_calls]
+            
+            tool_results = []
+            for future in futures:
+                result = future.result()
+                
+                # Display result
+                display_result = dict(result)
+                transcript = display_result.get("transcript", "")
+                if isinstance(transcript, str) and len(transcript) > 4000:
+                    display_result["transcript"] = transcript[:4000] + "\n...[TRUNCATED]..."
+                
+                print_panel(
+                    json.dumps(display_result, indent=2, ensure_ascii=False),
+                    "Orchestrator Tool Result",
+                    "result",
+                )
+                log_step("ORCH_TOOL_RESULT", "run_researcher completed")
+                emit_event("ORCH_TOOL_RESULT", {"tool": "run_researcher"})
+                
+                llm_result = _build_llm_experiment_result(result)
+                tool_results.append(json.dumps(llm_result))
+                
+                if isinstance(result, dict) and "experiment_id" in result:
+                    all_experiments.append(result)
+        
+        # Add tool results to history
+        messages.append(OllamaMessage(
+            role="user",
+            content="Tool results:\n" + "\n---\n".join(tool_results)
+        ))
+        
+        # Show experiment summary
+        if all_experiments:
+            summary_lines = []
+            for exp in all_experiments:
+                hyp_snippet = (exp.get("hypothesis", "") or "").replace("\n", " ")[:80]
+                summary_lines.append(
+                    f"Exp {exp.get('experiment_id')} | exit={exp.get('exit_code')} | {hyp_snippet}"
+                )
+            print_panel("\n".join(summary_lines), "Orchestrator: Experiments So Far", "dim")
+    
+    # Final paper request if loop ended without [DONE]
+    print_status(
+        "Orchestrator loop ended without explicit [DONE]. Requesting final paper...",
+        "bold yellow",
+    )
+    messages.append(OllamaMessage(
+        role="user",
+        content=(
+            "Using everything above, write the final Arxiv-style paper as specified. "
+            "End with [DONE]."
+        )
+    ))
+    
+    try:
+        final_response = client.chat(
+            messages=messages,
+            tools=None,
+            system_prompt=system_prompt,
+            stream=False,
+        )
+        
+        print_panel(final_response.content, "Final Paper", "bold green")
+        log_step("ORCH_FINAL", "Final paper generated.")
+        emit_event("ORCH_PAPER", {"content": final_response.content})
+    except Exception as e:
+        print_status(f"Failed to generate final paper: {e}", "error")
+        logger.error(f"Failed to generate final paper: {e}")
+
+
 def _run_claude_orchestrator_loop(
     research_task: str,
     num_initial_agents: int,
@@ -576,6 +841,8 @@ def _run_claude_orchestrator_loop(
     max_parallel_experiments: int,
 ) -> None:
     """Run the orchestrator loop using Claude Opus 4.5 with extended thinking."""
+    import anthropic
+    
     print_status("Claude extended thinking enabled", "info")
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -680,6 +947,7 @@ def _run_claude_orchestrator_loop(
             if joined_text:
                 print_panel(joined_text, "Orchestrator Message", "info")
                 log_step("ORCH_MODEL", joined_text)
+                emit_event("ORCH_MODEL", {"content": joined_text[:500]})
 
         # Check for completion
         combined_text = "\n".join(thinking_texts + text_content)
@@ -732,7 +1000,7 @@ def _run_claude_orchestrator_loop(
                 "code",
             )
             log_step("ORCH_TOOL_CALL", f"{fn_name}({fn_args})")
-            emit_event("ORCH_TOOL", {"tool": fn_name, "args": fn_args})
+            emit_event("ORCH_TOOL_CALL", {"tool": fn_name, "args": fn_args})
 
             if fn_name == "run_researcher":
                 return run_researcher(**fn_args)
@@ -775,6 +1043,7 @@ def _run_claude_orchestrator_loop(
                     "result",
                 )
                 log_step("ORCH_TOOL_RESULT", "run_researcher completed")
+                emit_event("ORCH_TOOL_RESULT", {"tool": "run_researcher"})
 
                 # Add tool_use to assistant content
                 fn_name = tool_block["name"]
@@ -892,6 +1161,9 @@ def _run_gemini_orchestrator_loop(
     max_parallel_experiments: int,
 ) -> None:
     """Run the orchestrator loop using Gemini 3 Pro with thinking mode."""
+    from google import genai
+    from google.genai import types
+    
     print_status("Gemini thinking: HIGH (thought summaries visible)", "info")
 
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
@@ -1067,6 +1339,7 @@ def _run_gemini_orchestrator_loop(
             joined_messages = "\n\n".join(messages)
             print_panel(joined_messages, "Orchestrator Message", "info")
             log_step("ORCH_MODEL", joined_messages)
+            emit_event("ORCH_MODEL", {"content": joined_messages[:500]})
 
         combined_text = "\n".join(thoughts + messages)
         if "[DONE]" in combined_text:
@@ -1106,7 +1379,7 @@ def _run_gemini_orchestrator_loop(
                 "code",
             )
             log_step("ORCH_TOOL_CALL", f"{fn_name}({fn_args})")
-            emit_event("ORCH_TOOL", {"tool": fn_name, "args": fn_args})
+            emit_event("ORCH_TOOL_CALL", {"tool": fn_name, "args": fn_args})
 
             if fn_name == "run_researcher":
                 return run_researcher(**fn_args)
@@ -1150,6 +1423,7 @@ def _run_gemini_orchestrator_loop(
                     "result",
                 )
                 log_step("ORCH_TOOL_RESULT", "run_researcher completed")
+                emit_event("ORCH_TOOL_RESULT", {"tool": "run_researcher"})
 
                 results_for_history.append(result)
 

@@ -34,6 +34,14 @@ export type TimelineItem =
     | { type: "agents"; agentIds: string[]; timestamp: number }
     | { type: "paper"; content: string; charts?: ChartSpec[]; timestamp: number };
 
+export interface ProgressState {
+    percent: number;
+    stage: "idle" | "initializing" | "decomposing" | "agents_running" | "generating_paper" | "completed";
+    stageLabel: string;
+    agentsTotal: number;
+    agentsCompleted: number;
+}
+
 export interface OrchestratorState {
     status: "idle" | "planning" | "running" | "completed";
     thoughts: string[];
@@ -52,6 +60,13 @@ export function useExperiment() {
         timeline: [],
     });
     const [error, setError] = useState<string | null>(null);
+    const [progress, setProgress] = useState<ProgressState>({
+        percent: 0,
+        stage: "idle",
+        stageLabel: "Ready",
+        agentsTotal: 0,
+        agentsCompleted: 0,
+    });
 
     // Keep track of the latest agents state to update it functionally
     const agentsRef = useRef<Record<string, AgentState>>({});
@@ -284,6 +299,13 @@ export function useExperiment() {
         setError(null);
         setAgents({});
         setOrchestrator({ thoughts: [], plan: [], timeline: [], status: "running" });
+        setProgress({
+            percent: 0,
+            stage: "initializing",
+            stageLabel: "Initializing...",
+            agentsTotal: 0,
+            agentsCompleted: 0,
+        });
 
         try {
             const endpoint = mode === "single"
@@ -384,7 +406,70 @@ export function useExperiment() {
         const { type, data } = event;
 
         switch (type) {
+            case "ORCH_START":
+                setProgress({
+                    percent: 5,
+                    stage: "initializing",
+                    stageLabel: "Initializing...",
+                    agentsTotal: 0,
+                    agentsCompleted: 0,
+                });
+                break;
+
+            case "ORCH_THOUGHT":
+            case "ORCH_MODEL":
+                setProgress(prev => ({
+                    ...prev,
+                    percent: Math.min(prev.percent + 5, 20),
+                    stage: "decomposing",
+                    stageLabel: "Decomposing task...",
+                }));
+                break;
+
+            case "ORCH_TOOL_CALL":
+            case "ORCH_EXPERIMENT":
+                setProgress(prev => ({
+                    ...prev,
+                    percent: 25,
+                    stage: "agents_running",
+                    stageLabel: "Launching agents...",
+                    agentsTotal: prev.agentsTotal + 1,
+                }));
+                break;
+
+            case "ORCH_TOOL_RESULT":
+                setProgress(prev => {
+                    const completed = prev.agentsCompleted + 1;
+                    const total = Math.max(prev.agentsTotal, 1);
+                    const agentProgress = (completed / total) * 50;
+                    return {
+                        ...prev,
+                        percent: Math.min(25 + agentProgress, 75),
+                        stage: completed >= total ? "generating_paper" : "agents_running",
+                        stageLabel: completed >= total ? "Generating paper..." : `Agent ${completed}/${total} done`,
+                        agentsCompleted: completed,
+                    };
+                });
+                break;
+
+            case "ORCH_PAPER":
+            case "ORCH_FINAL":
+                setProgress({
+                    percent: 100,
+                    stage: "completed",
+                    stageLabel: "Complete!",
+                    agentsTotal: 0,
+                    agentsCompleted: 0,
+                });
+                setOrchestrator(prev => ({ ...prev, status: "completed" }));
+                break;
+
             case "AGENT_START":
+                setProgress(prev => ({
+                    ...prev,
+                    stage: "agents_running",
+                    stageLabel: `Agent ${data.agent_id} running...`,
+                }));
                 updateAgent(data.agent_id, {
                     status: "running",
                     hypothesis: data.hypothesis,
@@ -419,80 +504,85 @@ export function useExperiment() {
                 });
                 break;
 
-            case "AGENT_THOUGHT":
-                if (inferredAgentId) {
-                    addAgentStep(inferredAgentId, {
-                        type: "thought",
-                        content: data.thought,
-                    });
-                    scheduleAgentSummary(inferredAgentId);
+            case "AGENT_THOUGHT": {
+                // Use agent_id from data, or inferred, or fallback to "1" for single mode
+                const agentId = data.agent_id || inferredAgentId || "1";
+                addAgentStep(agentId, {
+                    type: "thought",
+                    content: data.thought,
+                });
+                scheduleAgentSummary(agentId);
+                break;
+            }
+
+            case "AGENT_THOUGHT_STREAM": {
+                const agentId = data.agent_id || inferredAgentId || "1";
+                if (typeof data?.chunk === "string") {
+                    appendToLatestAgentStep(agentId, "thought", data.chunk);
+                    scheduleAgentSummary(agentId);
                 }
                 break;
+            }
 
-            case "AGENT_THOUGHT_STREAM":
-                if (inferredAgentId && typeof data?.chunk === "string") {
-                    appendToLatestAgentStep(inferredAgentId, "thought", data.chunk);
-                    scheduleAgentSummary(inferredAgentId);
-                }
+            case "AGENT_TOOL": {
+                const agentId = data.agent_id || inferredAgentId || "1";
+                addAgentStep(agentId, {
+                    type: "code",
+                    content: `${data.tool}(${JSON.stringify(data.args, null, 2)})`,
+                    metadata: { tool: data.tool, args: data.args },
+                });
                 break;
+            }
 
-            case "AGENT_TOOL":
-                if (inferredAgentId) {
-                    addAgentStep(inferredAgentId, {
-                        type: "code",
-                        content: `${data.tool}(${JSON.stringify(data.args, null, 2)})`,
-                        metadata: { tool: data.tool, args: data.args },
-                    });
-                }
-                break;
+            case "AGENT_TOOL_RESULT": {
+                const agentId = data.agent_id || inferredAgentId || "1";
+                // Update the latest step if it's a result block (from streaming),
+                // otherwise create a new one.
+                setAgents((prev) => {
+                    const current = prev[agentId];
+                    if (!current) return prev;
 
-            case "AGENT_TOOL_RESULT":
-                if (inferredAgentId) {
-                    // Update the latest step if it's a result block (from streaming),
-                    // otherwise create a new one.
-                    setAgents((prev) => {
-                        const current = prev[inferredAgentId];
-                        if (!current) return prev;
+                    const steps = [...current.steps];
+                    const lastStep = steps[steps.length - 1];
 
-                        const steps = [...current.steps];
-                        const lastStep = steps[steps.length - 1];
-
-                        if (lastStep && lastStep.type === "result") {
-                            // Update existing result block with the final full content
-                            steps[steps.length - 1] = {
-                                ...lastStep,
-                                content: data.result,
-                                metadata: { ...lastStep.metadata, tool: data.tool }
-                            };
-                        } else {
-                            // Create new result block
-                            steps.push({
-                                id: Math.random().toString(36).substring(7),
-                                type: "result",
-                                content: data.result,
-                                metadata: { tool: data.tool },
-                                timestamp: Date.now(),
-                            });
-                        }
-
-                        return {
-                            ...prev,
-                            [inferredAgentId]: { ...current, steps }
+                    if (lastStep && lastStep.type === "result") {
+                        // Update existing result block with the final full content
+                        steps[steps.length - 1] = {
+                            ...lastStep,
+                            content: data.result,
+                            metadata: { ...lastStep.metadata, tool: data.tool }
                         };
-                    });
+                    } else {
+                        // Create new result block
+                        steps.push({
+                            id: Math.random().toString(36).substring(7),
+                            type: "result",
+                            content: data.result,
+                            metadata: { tool: data.tool },
+                            timestamp: Date.now(),
+                        });
+                    }
 
-                    scheduleAgentSummary(inferredAgentId);
-                }
+                    return {
+                        ...prev,
+                        [agentId]: { ...current, steps }
+                    };
+                });
+
+                scheduleAgentSummary(agentId);
                 break;
+            }
 
-            case "AGENT_STREAM":
-                if (inferredAgentId && typeof data?.chunk === "string") {
+            case "AGENT_STREAM": {
+                const agentId = data.agent_id || inferredAgentId || "1";
+                if (typeof data?.chunk === "string") {
                     // Stream incremental sandbox output into the latest result cell.
                     // NotebookCell already handles carriage returns (\r) to render
                     // tqdm-style progress bars cleanly.
-                    appendToLatestAgentStep(inferredAgentId, "result", data.chunk);
+                    appendToLatestAgentStep(agentId, "result", data.chunk);
                 }
                 break;
+            }
 
             case "AGENT_COMPLETE":
                 updateAgent(data.agent_id, {
@@ -572,6 +662,7 @@ export function useExperiment() {
         agents,
         orchestrator,
         error,
+        progress,
         startExperiment,
         clearError,
     };
