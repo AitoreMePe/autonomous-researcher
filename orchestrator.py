@@ -699,24 +699,35 @@ def _run_ollama_orchestrator_loop(
         except Exception as e:
             print_status(f"Ollama API Error: {e}", "error")
             logger.error(f"Ollama API Error: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             break
         
+        # Debug: Log after streaming completes
+        logger.info(f"[ORCH_DEBUG] Streaming complete. Content length: {len(full_content)}, tool_calls: {len(tool_calls)}")
+        
         # Show thinking if present
+        logger.info(f"[ORCH_DEBUG] Checking thinking... full_thinking length: {len(full_thinking) if full_thinking else 0}")
         if full_thinking:
             print_panel(full_thinking, "Orchestrator Thinking", "thought")
             log_step("ORCH_THOUGHT", full_thinking)
+            logger.info("[ORCH_DEBUG] Thinking logged")
         
         # Extract text content for display
         import re
+        logger.info("[ORCH_DEBUG] Extracting display content...")
         display_content = re.sub(r'```tool_call\s*\n?.*?\n?```', '', full_content, flags=re.DOTALL).strip()
+        logger.info(f"[ORCH_DEBUG] Display content length: {len(display_content)}")
         
         if display_content:
             print_panel(display_content, "Orchestrator Message", "info")
             log_step("ORCH_MODEL", display_content)
             emit_event("ORCH_MODEL", {"content": display_content[:500]})
+            logger.info("[ORCH_DEBUG] Display content emitted")
         
-        # Check for completion
-        if "[DONE]" in full_content:
+        # Check for completion - BUT only if there are no tool calls to execute
+        # Some models (like qwen2.5:3b) may output [DONE] prematurely while also outputting a tool call
+        if "[DONE]" in full_content and not tool_calls:
             if display_content:
                 final_content = display_content.replace("[DONE]", "").strip()
                 if final_content:
@@ -727,21 +738,53 @@ def _run_ollama_orchestrator_loop(
             return
         
         # Add assistant message to history
+        logger.info("[ORCH_DEBUG] Adding assistant message to history...")
         messages.append(OllamaMessage(role="assistant", content=full_content))
+        logger.info(f"[ORCH_DEBUG] Messages count: {len(messages)}")
         
         # Process tool calls
+        logger.info(f"[ORCH_DEBUG] Processing tool calls... count: {len(tool_calls)}")
         if not tool_calls:
-            print_status(
-                "Orchestrator: no tool calls in this step; assuming research is complete.",
-                "info",
-            )
-            break
+            # Debug: Log full content to see what's happening
+            logger.debug(f"[ORCH_DEBUG] No tool calls found. Full content length: {len(full_content)}")
+            logger.debug(f"[ORCH_DEBUG] Content preview: {full_content[-1000:]}")  # Last 1000 chars
+            
+            # Try to find tool calls manually as fallback
+            import re
+            manual_pattern = r'\{\s*"tool"\s*:\s*"run_researcher"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}'
+            manual_matches = re.findall(manual_pattern, full_content, re.DOTALL)
+            
+            if manual_matches:
+                logger.info(f"[ORCH_DEBUG] Found {len(manual_matches)} manual tool call matches - parsing...")
+                for match in manual_matches:
+                    try:
+                        data = json.loads(match)
+                        if data.get("tool") == "run_researcher":
+                            from ollama_client import OllamaToolCall
+                            tool_calls.append(OllamaToolCall(
+                                id=f"manual_call_{len(tool_calls)}",
+                                name="run_researcher",
+                                arguments=data.get("arguments", {})
+                            ))
+                            logger.info(f"[ORCH_DEBUG] Manually parsed tool call: {data.get('arguments', {}).get('hypothesis', 'N/A')[:50]}...")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[ORCH_DEBUG] Failed to parse manual match: {e}")
+            
+            if not tool_calls:
+                print_status(
+                    "Orchestrator: no tool calls in this step; assuming research is complete.",
+                    "info",
+                )
+                break
         
         # Execute tool calls
+        logger.info(f"[ORCH_DEBUG] About to execute {len(tool_calls)} tool calls")
+        
         def _execute_single_call(tc):
             fn_name = tc.name
             fn_args = tc.arguments
             
+            logger.info(f"[ORCH_DEBUG] Executing tool: {fn_name}")
             print_panel(
                 f"{fn_name}({json.dumps(fn_args, indent=2)})",
                 "Orchestrator Tool Call",

@@ -78,11 +78,13 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["gemini-3-pro-preview", "claude-opus-4-5"],
         default="gemini-3-pro-preview",
         help=(
-            "LLM model to use: "
-            "'gemini-3-pro-preview' (default) or 'claude-opus-4-5'."
+            "LLM model to use. Options:\n"
+            "  - 'gemini-3-pro-preview' (default) - Google Gemini 3 Pro\n"
+            "  - 'claude-opus-4-5' - Anthropic Claude Opus 4.5\n"
+            "  - 'ollama:<model>' - Local Ollama model (e.g., 'ollama:qwen2.5-coder:14b')\n"
+            "For Ollama, code runs locally using your GPU instead of Modal."
         ),
     )
 

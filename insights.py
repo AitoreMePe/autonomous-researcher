@@ -2,8 +2,10 @@
 
 This helper stays **separate** from the main agents/orchestrator logic.
 It only consumes the recent public transcript (last ~5 steps) and asks a
-cheaper Gemini model (no thinking mode) to condense it into a tiny finding
-plus an optional chart spec the frontend can render.
+cheaper model to condense it into a tiny finding plus an optional chart spec
+the frontend can render.
+
+Supports both Gemini (cloud) and Ollama (local) backends.
 """
 
 from __future__ import annotations
@@ -13,25 +15,64 @@ import os
 import logging
 from typing import Any, Dict, List, Optional
 
-from google import genai
-from google.genai import types
-
 logger = logging.getLogger(__name__)
 
 
-_client: Optional[genai.Client] = None
+_gemini_client = None
+_ollama_client = None
+_backend: Optional[str] = None  # "gemini", "ollama", or None
 
 
-def _get_client() -> genai.Client:
+def _get_backend() -> str:
+    """Determine which backend to use for summarization."""
+    global _backend
+    
+    if _backend is not None:
+        return _backend
+    
+    # Prefer Gemini if API key is available
+    if os.environ.get("GOOGLE_API_KEY"):
+        _backend = "gemini"
+        return _backend
+    
+    # Fall back to Ollama if available
+    try:
+        from ollama_client import test_ollama_connection
+        if test_ollama_connection():
+            _backend = "ollama"
+            return _backend
+    except ImportError:
+        pass
+    
+    # No backend available
+    _backend = "none"
+    return _backend
+
+
+def _get_gemini_client():
     """Lazily create a single Gemini client (re-used across requests)."""
-
-    global _client
-    if _client is None:
+    global _gemini_client
+    
+    if _gemini_client is None:
+        from google import genai
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY is not set")
-        _client = genai.Client(api_key=api_key)
-    return _client
+        _gemini_client = genai.Client(api_key=api_key)
+    
+    return _gemini_client
+
+
+def _get_ollama_client():
+    """Lazily create a single Ollama client (re-used across requests)."""
+    global _ollama_client
+    
+    if _ollama_client is None:
+        from ollama_client import OllamaClient
+        # Use a smaller/faster model for summarization
+        _ollama_client = OllamaClient(model="qwen3:8b", temperature=0.2)
+    
+    return _ollama_client
 
 
 def _build_prompt(history: List[Dict[str, str]]) -> str:
@@ -80,45 +121,71 @@ def summarize_agent_findings(
         "Omit chart if no numeric series are present."
     )
 
-    client = _get_client()
-
-    try:
-        response = client.models.generate_content(
-            model="gemini-3-pro-preview",  # cheaper, no thinking mode
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt)],
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2,
-                max_output_tokens=4000,
-            ),
-        )
-    except Exception as e:
-        logger.error("Gemini summarize failed for agent %s: %s", agent_id, e)
-        raise
-
+    backend = _get_backend()
+    
+    if backend == "none":
+        # No LLM available - return a simple extraction
+        return {"summary": "LLM not available for summarization", "chart": None}
+    
     raw_text = ""
-    try:
-        # Prefer the convenience accessor if available
-        raw_text = getattr(response, "text", "") or ""
-        if not raw_text:
-            candidate = response.candidates[0]
-            if candidate.content and candidate.content.parts:
-                for part in candidate.content.parts:
-                    if getattr(part, "text", None):
-                        raw_text += part.text
-                    elif getattr(part, "inline_data", None) and getattr(part.inline_data, "data", None):
-                        try:
-                            raw_text += part.inline_data.data.decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-        raw_text = raw_text.strip()
-    except Exception as e:
-        logger.warning("Failed to extract text for agent %s: %s", agent_id, e)
+    
+    if backend == "ollama":
+        # Use Ollama for summarization
+        try:
+            from ollama_client import OllamaMessage
+            client = _get_ollama_client()
+            
+            response = client.chat(
+                messages=[OllamaMessage(role="user", content=prompt)],
+                system_prompt=system_instruction,
+                stream=False,
+            )
+            raw_text = response.content.strip()
+        except Exception as e:
+            logger.error("Ollama summarize failed for agent %s: %s", agent_id, e)
+            raise
+    else:
+        # Use Gemini for summarization
+        from google.genai import types
+        
+        client = _get_gemini_client()
+
+        try:
+            response = client.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=prompt)],
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                    max_output_tokens=4000,
+                ),
+            )
+        except Exception as e:
+            logger.error("Gemini summarize failed for agent %s: %s", agent_id, e)
+            raise
+
+        try:
+            # Prefer the convenience accessor if available
+            raw_text = getattr(response, "text", "") or ""
+            if not raw_text:
+                candidate = response.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if getattr(part, "text", None):
+                            raw_text += part.text
+                        elif getattr(part, "inline_data", None) and getattr(part.inline_data, "data", None):
+                            try:
+                                raw_text += part.inline_data.data.decode("utf-8", errors="ignore")
+                            except Exception:
+                                pass
+            raw_text = raw_text.strip()
+        except Exception as e:
+            logger.warning("Failed to extract text for agent %s: %s", agent_id, e)
 
     result: Dict[str, Any]
     try:

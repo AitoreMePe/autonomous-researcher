@@ -6,6 +6,7 @@ including support for tool/function calling and streaming responses.
 """
 
 import json
+import logging
 import requests
 from typing import Optional, List, Dict, Any, Generator, Callable
 from dataclasses import dataclass, field
@@ -59,7 +60,7 @@ class OllamaClient:
         model: str = "qwen2.5-coder:14b",
         base_url: str = OLLAMA_BASE_URL,
         temperature: float = 0.7,
-        num_ctx: int = 32768,  # Context window size
+        num_ctx: int = 4096,  # Context window size (reduced for GPU compatibility)
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -234,6 +235,13 @@ IMPORTANT:
         # Add any balanced JSON objects found
         matches += extract_json_objects(content)
         
+        # Debug logging
+        import logging
+        logging.debug(f"[TOOL_PARSE] Content length: {len(content)}")
+        logging.debug(f"[TOOL_PARSE] Found {len(matches)} potential tool call matches")
+        for i, m in enumerate(matches[:3]):  # Log first 3
+            logging.debug(f"[TOOL_PARSE] Match {i}: {m[:200]}...")
+        
         seen_tools = set()  # Avoid duplicates
         
         for match in matches:
@@ -252,20 +260,24 @@ IMPORTANT:
                         name=tool_name,
                         arguments=arguments,
                     ))
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
                 # Invalid JSON, skip this block
+                logging.debug(f"[TOOL_PARSE] JSON decode error for match: {e}")
+                logging.debug(f"[TOOL_PARSE] Failed match content: {match[:300]}...")
                 continue
         
+        logging.info(f"[TOOL_PARSE] Final tool_calls count: {len(tool_calls)}")
         return tool_calls
     
     def _extract_thinking(self, content: str) -> tuple[str, str]:
         """
         Extract thinking/reasoning from content if present.
         
-        Some models (like DeepSeek) use <think>...</think> tags.
+        Some models (like DeepSeek, Qwen3) use <think>...</think> tags.
         Returns (thinking, remaining_content).
         """
         import re
+        import logging
         
         # Check for <think> tags
         think_pattern = r'<think>(.*?)</think>'
@@ -275,6 +287,8 @@ IMPORTANT:
             thinking = "\n\n".join(think_matches)
             # Remove thinking blocks from content
             remaining = re.sub(think_pattern, '', content, flags=re.DOTALL).strip()
+            logging.debug(f"[THINKING] Extracted {len(thinking)} chars of thinking")
+            logging.debug(f"[THINKING] Remaining content: {remaining[:500]}...")
             return thinking, remaining
         
         return "", content
@@ -368,7 +382,12 @@ IMPORTANT:
     ) -> Generator[OllamaResponse, None, None]:
         """Streaming chat completion."""
         try:
+            logging.info(f"[STREAM_DEBUG] Sending request to {url}")
+            logging.info(f"[STREAM_DEBUG] Model: {payload.get('model')}")
+            logging.info(f"[STREAM_DEBUG] Messages count: {len(payload.get('messages', []))}")
+            
             with self.session.post(url, json=payload, stream=True, timeout=3600) as response:  # 1 hour for slow models
+                logging.info(f"[STREAM_DEBUG] Response status: {response.status_code}")
                 response.raise_for_status()
                 
                 full_content = ""
@@ -395,8 +414,11 @@ IMPORTANT:
                         )
                     else:
                         # Final chunk - parse everything
+                        logging.info(f"[STREAM] Final chunk received. Full content length: {len(full_content)}")
                         thinking, remaining = self._extract_thinking(full_content)
+                        logging.info(f"[STREAM] Thinking extracted. Length: {len(thinking)}, remaining: {len(remaining)}")
                         tool_calls = self._parse_tool_calls(full_content)
+                        logging.info(f"[STREAM] Tool calls parsed: {len(tool_calls)}")
                         
                         yield OllamaResponse(
                             content=remaining,
@@ -407,8 +429,12 @@ IMPORTANT:
                             total_duration=data.get("total_duration"),
                             eval_count=data.get("eval_count"),
                         )
+                        logging.info(f"[STREAM] Final response yielded")
                         
         except requests.exceptions.RequestException as e:
+            logging.error(f"[STREAM_ERROR] Request failed: {e}")
+            logging.error(f"[STREAM_ERROR] Model: {payload.get('model')}")
+            logging.error(f"[STREAM_ERROR] System prompt length: {len(str(payload.get('messages', [{}])[0].get('content', '')))}")
             raise ConnectionError(f"Failed to connect to Ollama at {self.base_url}: {e}")
     
     def list_models(self) -> List[Dict[str, Any]]:
@@ -500,5 +526,8 @@ def test_ollama_connection(base_url: str = OLLAMA_BASE_URL) -> bool:
         return response.status_code == 200
     except requests.exceptions.RequestException:
         return False
+
+
+
 
 
