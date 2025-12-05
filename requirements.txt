@@ -1,8 +1,18 @@
-google-genai
-anthropic
-modal
-python-dotenv
-rich
-fastapi
-uvicorn[standard]
-python-dotenv
+# AI Research Agent - Local Dependencies
+# Runs 100% locally with Ollama
+
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+
+# Scientific computing (for experiments)
+numpy>=1.24.0
+pandas>=2.0.0
+sympy>=1.12
+matplotlib>=3.7.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# CUDA-accelerated search (required for cuda_search.py)
+torch>=2.0.0

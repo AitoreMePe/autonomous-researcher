@@ -23,7 +23,7 @@ def setup_logging():
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.FileHandler("agent.log"),
+            logging.FileHandler("agent.log", encoding='utf-8'),
             # We don't add RichHandler here because we want manual control over console output
             # to keep it "elegant" and not just a stream of logs.
         ]
@@ -31,6 +31,10 @@ def setup_logging():
     # Create a separate logger for the file that doesn't propagate to root
     file_logger = logging.getLogger("agent_file")
     file_logger.setLevel(logging.DEBUG)
+    # Use UTF-8 encoding for file handler
+    handler = logging.FileHandler("agent_file.log", encoding='utf-8')
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    file_logger.addHandler(handler)
     return file_logger
 
 # Global file logger instance
@@ -38,12 +42,24 @@ logger = setup_logging()
 
 def log_step(step_name, status="INFO"):
     """Logs a step to the file."""
-    logger.info(f"[{step_name}] {status}")
+    # Replace problematic Unicode characters with ASCII equivalents
+    safe_status = status.replace('≥', '>=').replace('≤', '<=').replace('≠', '!=').replace('→', '->').replace('←', '<-')
+    try:
+        logger.info(f"[{step_name}] {safe_status}")
+    except UnicodeEncodeError:
+        # Fallback: encode to ASCII with replacement
+        logger.info(f"[{step_name}] {safe_status.encode('ascii', 'replace').decode('ascii')}")
 
 def print_panel(content, title, style="info"):
     """Prints a rich panel to the console."""
-    console.print(Panel(content, title=title, border_style=style, expand=False))
+    from rich.markup import escape
+    # Escape Rich markup characters in content to prevent MarkupError with tags like [RUN_EXPERIMENT]
+    safe_content = escape(content)
+    console.print(Panel(safe_content, title=title, border_style=style, expand=False))
 
 def print_status(message, style="info"):
     """Prints a status message."""
-    console.print(f"[{style}]{message}[/{style}]")
+    from rich.markup import escape
+    # Escape Rich markup characters in message to prevent MarkupError with tags like [RUN_EXPERIMENT]
+    safe_message = escape(message)
+    console.print(f"[{style}]{safe_message}[/{style}]")
